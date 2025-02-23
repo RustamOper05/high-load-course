@@ -13,6 +13,7 @@ import java.time.Duration
 import java.util.*
 import java.util.concurrent.TimeUnit
 import ru.quipy.common.utils.LeakingBucketRateLimiter
+import ru.quipy.common.utils.NonBlockingOngoingWindow
 
 // Advice: always treat time as a Duration
 class PaymentExternalSystemAdapterImpl(
@@ -41,6 +42,8 @@ class PaymentExternalSystemAdapterImpl(
         bucketSize = rateLimitPerSec
     )
 
+    private val ongoingWindow = NonBlockingOngoingWindow(parallelRequests)
+
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
         val transactionId = UUID.randomUUID()
@@ -56,6 +59,22 @@ class PaymentExternalSystemAdapterImpl(
                 logger.warn("[$accountName] Rate limit timeout for payment $paymentId. Aborting external call.")
                 paymentESService.update(paymentId) {
                     it.logProcessing(false, now(), transactionId, reason = "Rate limit timeout exceeded")
+                }
+                return
+            }
+        }
+
+        while (true) {
+            val windowResponse = ongoingWindow.putIntoWindow()
+            if (windowResponse is NonBlockingOngoingWindow.WindowResponse.Success) {
+                break
+            }
+            
+            // Thread.sleep(1)
+            if (System.currentTimeMillis() >= deadline) {
+                logger.warn("[$accountName] Parallel requests limit timeout for payment $paymentId. Aborting external call.")
+                paymentESService.update(paymentId) {
+                    it.logSubmission(false, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
                 }
                 return
             }
@@ -96,6 +115,8 @@ class PaymentExternalSystemAdapterImpl(
                     }
                 }
             }
+        } finally {
+            ongoingWindow.releaseWindow()
         }
     }
 
