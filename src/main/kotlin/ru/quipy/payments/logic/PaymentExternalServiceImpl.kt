@@ -8,12 +8,12 @@ import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
+import ru.quipy.common.utils.LeakingBucketRateLimiter
+import ru.quipy.common.utils.OngoingWindow
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
-import java.util.concurrent.TimeUnit
-import ru.quipy.common.utils.LeakingBucketRateLimiter
-import ru.quipy.common.utils.NonBlockingOngoingWindow
+
 
 // Advice: always treat time as a Duration
 class PaymentExternalSystemAdapterImpl(
@@ -36,48 +36,17 @@ class PaymentExternalSystemAdapterImpl(
 
     private val client = OkHttpClient.Builder().build()
 
-    private val rateLimiter = LeakingBucketRateLimiter(
-        rate = rateLimitPerSec.toLong(),
-        window = Duration.ofSeconds(1),
-        bucketSize = rateLimitPerSec
-    )
-
-    private val ongoingWindow = NonBlockingOngoingWindow(parallelRequests)
+    private val rateLimiter = LeakingBucketRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1), rateLimitPerSec)
+    private val ongoingWindow = OngoingWindow(parallelRequests)
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
+
         val transactionId = UUID.randomUUID()
-        logger.info("[$accountName] Submit for $paymentId , txId: $transactionId")
+        logger.info("[$accountName] Submit for $paymentId, txId: $transactionId")
 
         paymentESService.update(paymentId) {
             it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
-        }
-
-        while (!rateLimiter.tick()) {
-            Thread.sleep(10)
-            if (System.currentTimeMillis() >= deadline) {
-                logger.warn("[$accountName] Rate limit timeout for payment $paymentId. Aborting external call.")
-                paymentESService.update(paymentId) {
-                    it.logProcessing(false, now(), transactionId, reason = "Rate limit timeout exceeded")
-                }
-                return
-            }
-        }
-
-        while (true) {
-            val windowResponse = ongoingWindow.putIntoWindow()
-            if (windowResponse is NonBlockingOngoingWindow.WindowResponse.Success) {
-                break
-            }
-            
-            // Thread.sleep(1)
-            if (System.currentTimeMillis() >= deadline) {
-                logger.warn("[$accountName] Parallel requests limit timeout for payment $paymentId. Aborting external call.")
-                paymentESService.update(paymentId) {
-                    it.logSubmission(false, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
-                }
-                return
-            }
         }
 
         val request = Request.Builder().run {
@@ -86,12 +55,19 @@ class PaymentExternalSystemAdapterImpl(
         }.build()
 
         try {
+            ongoingWindow.acquire()
+
+            if (!rateLimiter.tick()) {
+                logger.warn("[$accountName] Rate limit exceeded, payment $paymentId delayed")
+                rateLimiter.tickBlocking()
+            }
+
             client.newCall(request).execute().use { response ->
                 val body = try {
                     mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
                 } catch (e: Exception) {
                     logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
-                    ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+                    ExternalSysResponse(transactionId.toString(), paymentId.toString(),false, e.message)
                 }
 
                 logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
@@ -108,15 +84,17 @@ class PaymentExternalSystemAdapterImpl(
                         it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
                     }
                 }
+
                 else -> {
                     logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
+
                     paymentESService.update(paymentId) {
                         it.logProcessing(false, now(), transactionId, reason = e.message)
                     }
                 }
             }
         } finally {
-            ongoingWindow.releaseWindow()
+            ongoingWindow.release()
         }
     }
 
