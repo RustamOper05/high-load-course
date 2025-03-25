@@ -6,6 +6,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
+import org.HdrHistogram.Histogram
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import ru.quipy.common.utils.SlidingWindowRateLimiter
@@ -13,11 +14,10 @@ import ru.quipy.common.utils.OngoingWindow
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
-import kotlin.math.min
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.ConcurrentLinkedDeque
 import kotlin.math.max
 
-
-// Advice: always treat time as a Duration
 class PaymentExternalSystemAdapterImpl(
     private val properties: PaymentAccountProperties,
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>
@@ -28,6 +28,11 @@ class PaymentExternalSystemAdapterImpl(
 
         val emptyBody = RequestBody.create(null, ByteArray(0))
         val mapper = ObjectMapper().registerKotlinModule()
+
+        val RETRIABLE_ERROR_CODES = listOf(429, 500, 502, 503, 504)
+
+        val TIMEOUT_PERCENTILE = 92.0
+        val MAX_HISTOGRAM_RECORDS = 10000
     }
 
     private val serviceName = properties.serviceName
@@ -36,10 +41,16 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
-    private val client = OkHttpClient.Builder().build()
+    private val clientBase = OkHttpClient.Builder().build()
 
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
     private val ongoingWindow = OngoingWindow(parallelRequests)
+
+    private val responseTimes = ConcurrentLinkedDeque<Long>()
+    private var histogram = Histogram(1, requestAverageProcessingTime.toMillis() * 2, 1)
+    private var percentileTimeout = requestAverageProcessingTime.toMillis() * 2
+
+    private var medProcessingTime = requestAverageProcessingTime.toMillis()
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
@@ -59,9 +70,11 @@ class PaymentExternalSystemAdapterImpl(
         var curRetry = 0
         val maxRetries = (deadline - paymentStartedAt) / requestAverageProcessingTime.toMillis()
         var delay = requestAverageProcessingTime.toMillis() / 4
-        var factor = 2
 
         while (curRetry < maxRetries) {
+            val startTime = now()
+            val estimatedProcessingTime = max(requestAverageProcessingTime.toMillis(), medProcessingTime)
+
             try {
                 if (!ongoingWindow.tryAcquire(deadline - now())) {
                     logger.error("[$accountName] Deadline exceeded, payment $paymentId canceled.")
@@ -78,15 +91,11 @@ class PaymentExternalSystemAdapterImpl(
                     rateLimiter.tickBlocking()
                 }
 
-                if (now() + requestAverageProcessingTime.toMillis() * factor >= deadline) {
-                    logger.error("[$accountName] Deadline exceeded, payment $paymentId canceled.")
-
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded.")
-                    }
-    
+                if (checkDeadlineExceeded(paymentId, transactionId, deadline, estimatedProcessingTime)) {
                     return
                 }
+
+                val client = clientBase.newBuilder().callTimeout(percentileTimeout, TimeUnit.MILLISECONDS).build()
 
                 client.newCall(request).execute().use { response ->
                     val body = try {
@@ -106,7 +115,7 @@ class PaymentExternalSystemAdapterImpl(
                         return
                     }
 
-                    if (response.code !in listOf(429, 500, 502, 503, 504)) {
+                    if (response.code !in RETRIABLE_ERROR_CODES) {
                         logger.warn("[$accountName] Non-retriable error for $paymentId, stopping retries.")
                         return
                     }
@@ -117,12 +126,17 @@ class PaymentExternalSystemAdapterImpl(
                 logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
                 return
             } finally {
+                addResponseTime(now() - startTime)
+                percentileTimeout = histogram.getValueAtPercentile(TIMEOUT_PERCENTILE)
+
+                logger.info("[$accountName] Percentile timeout updated: $percentileTimeout ms.")
+
                 ongoingWindow.release()
             }
 
             logger.warn("[$accountName] Retrying payment $paymentId in $delay ms (attempt $curRetry/$maxRetries).")
             Thread.sleep(delay)
-            
+
             delay = delay * 2
             curRetry++
         }
@@ -139,6 +153,35 @@ class PaymentExternalSystemAdapterImpl(
     override fun isEnabled() = properties.enabled
 
     override fun name() = properties.accountName
+
+    private fun checkDeadlineExceeded(paymentId: UUID, transactionId: UUID, deadline: Long, estimatedProcessingTime: Long): Boolean {
+        if (now() + estimatedProcessingTime >= deadline) {
+            logger.error("[$accountName] Deadline exceeded, payment $paymentId canceled.")
+
+            paymentESService.update(paymentId) {
+                it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded.")
+            }
+
+            return true
+        }
+
+        return false
+    }
+
+    private fun addResponseTime(responseTime: Long) {
+        synchronized(responseTimes) {
+            responseTimes.add(responseTime)
+
+            while (responseTimes.size > MAX_HISTOGRAM_RECORDS) {
+                responseTimes.removeFirst()
+            }
+
+            val newHistogram = Histogram(1, requestAverageProcessingTime.toMillis() * 2, 1)
+            responseTimes.forEach { newHistogram.recordValue(it) }
+
+            histogram = newHistogram
+        }
+    }
 
 }
 
